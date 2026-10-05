@@ -1,0 +1,11 @@
+App(
+    appid="bt_command",
+    name="BT Command",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="bt_command_app",
+    stack_size=2 * 1024,
+    fap_version="1.0",
+    fap_category="Bluetooth",
+    fap_author="Hermes Agent",
+    fap_description="Status console for the BLE command channel (RPC tags 101-105).",
+)

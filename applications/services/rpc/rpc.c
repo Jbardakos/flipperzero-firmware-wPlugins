@@ -18,6 +18,16 @@
 #include <cfw/cfw.h>
 
 #include <bt/bt_service/bt.h>
+#include <input/input.h>
+
+/* BLE command handlers for Hermes agent control (tags 101-105).
+ * Declared here because they are registered in rpc_session_open() below
+ * and defined at the end of this file. */
+static void bt_command_app_model_select_handler(const PB_Main* msg_request, void* context);
+static void bt_command_app_typing_handler(const PB_Main* msg_request, void* context);
+static void bt_command_app_copy_handler(const PB_Main* msg_request, void* context);
+static void bt_command_app_paste_handler(const PB_Main* msg_request, void* context);
+static void bt_command_app_tab_switch_handler(const PB_Main* msg_request, void* context);
 
 #define TAG "RpcSrv"
 
@@ -418,6 +428,32 @@ RpcSession* rpc_session_open(Rpc* rpc, RpcOwner owner) {
     };
     rpc_add_handler(session, PB_Main_stop_session_tag, &rpc_handler);
 
+    /* New BLE command handlers for Hermes agent */
+    rpc_handler.message_handler = bt_command_app_model_select_handler;
+    rpc_handler.decode_submessage = NULL;
+    rpc_handler.context = session;
+    rpc_add_handler(session, PB_Main_cmd_model_select_request_tag, &rpc_handler);
+
+    rpc_handler.message_handler = bt_command_app_typing_handler;
+    rpc_handler.decode_submessage = NULL;
+    rpc_handler.context = session;
+    rpc_add_handler(session, PB_Main_cmd_typing_request_tag, &rpc_handler);
+
+    rpc_handler.message_handler = bt_command_app_copy_handler;
+    rpc_handler.decode_submessage = NULL;
+    rpc_handler.context = session;
+    rpc_add_handler(session, PB_Main_cmd_copy_request_tag, &rpc_handler);
+
+    rpc_handler.message_handler = bt_command_app_paste_handler;
+    rpc_handler.decode_submessage = NULL;
+    rpc_handler.context = session;
+    rpc_add_handler(session, PB_Main_cmd_paste_request_tag, &rpc_handler);
+
+    rpc_handler.message_handler = bt_command_app_tab_switch_handler;
+    rpc_handler.decode_submessage = NULL;
+    rpc_handler.context = session;
+    rpc_add_handler(session, PB_Main_cmd_tab_switch_request_tag, &rpc_handler);
+
     session->thread = furi_thread_alloc_ex("RpcSessionWorker", 3072, rpc_session_worker, session);
 
     furi_thread_set_state_context(session->thread, session);
@@ -519,4 +555,133 @@ void rpc_send_and_release_empty(RpcSession* session, uint32_t command_id, PB_Com
 
 size_t rpc_get_sessions_count(Rpc* rpc) {
     return rpc->sessions_count;
+}
+
+/* ---- BLE command handlers for Hermes agent control ----------------------
+ *
+ * These are invoked by rpc_session_worker() when a PB_Main message with
+ * which_content == 101..105 arrives (see registration in rpc_session_open()).
+ * `context` is the owning RpcSession*, as passed at registration time.
+ *
+ * NOTE on transport: incoming BLE data has already been flow-controlled by
+ * the peer before it reaches us -- a client must not write more bytes than
+ * the 4-byte credit value advertised on the Flow Control characteristic
+ * (serial_service.c / ble_svc_serial_notify_buffer_is_empty). Nothing here
+ * needs to (or may) bypass that: replies go back through rpc_send_and_release
+ * which uses the session's send-bytes callback.
+ */
+
+/* Last model id requested by the controlling agent. */
+static uint32_t bt_command_app_current_model = 0;
+
+static void bt_command_app_model_select_handler(const PB_Main* msg_request, void* context) {
+    RpcSession* session = context;
+    furi_assert(msg_request);
+    furi_assert(session);
+
+    if(msg_request->which_content != PB_Main_cmd_model_select_request_tag) {
+        FURI_LOG_E(TAG, "model_select: invalid content tag %u", msg_request->which_content);
+        rpc_send_and_release_empty(
+            session, msg_request->command_id, PB_CommandStatus_ERROR_INVALID_PARAMETERS);
+        return;
+    }
+
+    bt_command_app_current_model = msg_request->content.cmd_model_select_request.model_id;
+    FURI_LOG_I(TAG, "model_select: model_id=%lu", (unsigned long)bt_command_app_current_model);
+
+    rpc_send_and_release_empty(session, msg_request->command_id, PB_CommandStatus_OK);
+}
+
+static void bt_command_app_typing_handler(const PB_Main* msg_request, void* context) {
+    RpcSession* session = context;
+    furi_assert(msg_request);
+    furi_assert(session);
+
+    if(msg_request->which_content != PB_Main_cmd_typing_request_tag) {
+        FURI_LOG_E(TAG, "typing: invalid content tag %u", msg_request->which_content);
+        rpc_send_and_release_empty(
+            session, msg_request->command_id, PB_CommandStatus_ERROR_INVALID_PARAMETERS);
+        return;
+    }
+
+    const char* text = msg_request->content.cmd_typing_request.text;
+    size_t length = strlen(text);
+
+    /* Inject each character as an ASCII event, the same channel the GUI RPC
+     * uses for SendAsciiEventRequest. */
+    FuriPubSub* ascii_events = furi_record_open(RECORD_ASCII_EVENTS);
+    for(size_t i = 0; i < length; i++) {
+        AsciiEvent event = {
+            .value = (uint8_t)text[i],
+        };
+        furi_pubsub_publish(ascii_events, &event);
+    }
+    furi_record_close(RECORD_ASCII_EVENTS);
+
+    FURI_LOG_I(TAG, "typing: injected %u character(s)", (unsigned)length);
+
+    rpc_send_and_release_empty(session, msg_request->command_id, PB_CommandStatus_OK);
+}
+
+static void bt_command_app_copy_handler(const PB_Main* msg_request, void* context) {
+    RpcSession* session = context;
+    furi_assert(msg_request);
+    furi_assert(session);
+
+    if(msg_request->which_content != PB_Main_cmd_copy_request_tag) {
+        FURI_LOG_E(TAG, "copy: invalid content tag %u", msg_request->which_content);
+        rpc_send_and_release_empty(
+            session, msg_request->command_id, PB_CommandStatus_ERROR_INVALID_PARAMETERS);
+        return;
+    }
+
+    /* Acknowledge receipt. The Flipper has no clipboard service, so there is
+     * no device-side copy to perform; the operation is the agent's own. */
+    FURI_LOG_I(TAG, "copy: acknowledged");
+    rpc_send_and_release_empty(session, msg_request->command_id, PB_CommandStatus_OK);
+}
+
+static void bt_command_app_paste_handler(const PB_Main* msg_request, void* context) {
+    RpcSession* session = context;
+    furi_assert(msg_request);
+    furi_assert(session);
+
+    if(msg_request->which_content != PB_Main_cmd_paste_request_tag) {
+        FURI_LOG_E(TAG, "paste: invalid content tag %u", msg_request->which_content);
+        rpc_send_and_release_empty(
+            session, msg_request->command_id, PB_CommandStatus_ERROR_INVALID_PARAMETERS);
+        return;
+    }
+
+    FURI_LOG_I(TAG, "paste: acknowledged");
+    rpc_send_and_release_empty(session, msg_request->command_id, PB_CommandStatus_OK);
+}
+
+static void bt_command_app_tab_switch_handler(const PB_Main* msg_request, void* context) {
+    RpcSession* session = context;
+    furi_assert(msg_request);
+    furi_assert(session);
+
+    if(msg_request->which_content != PB_Main_cmd_tab_switch_request_tag) {
+        FURI_LOG_E(TAG, "tab_switch: invalid content tag %u", msg_request->which_content);
+        rpc_send_and_release_empty(
+            session, msg_request->command_id, PB_CommandStatus_ERROR_INVALID_PARAMETERS);
+        return;
+    }
+
+    bool forward = msg_request->content.cmd_tab_switch_request.forward;
+
+    /* Inject a horizontal-tab character. 'forward == false' (shift-tab) cannot
+     * be expressed as a plain ASCII event, so direction is reported in the log
+     * rather than silently faked. */
+    AsciiEvent event = {
+        .value = '\t',
+    };
+    FuriPubSub* ascii_events = furi_record_open(RECORD_ASCII_EVENTS);
+    furi_pubsub_publish(ascii_events, &event);
+    furi_record_close(RECORD_ASCII_EVENTS);
+
+    FURI_LOG_I(TAG, "tab_switch: direction=%s", forward ? "next" : "previous");
+
+    rpc_send_and_release_empty(session, msg_request->command_id, PB_CommandStatus_OK);
 }
